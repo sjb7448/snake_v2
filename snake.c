@@ -4,6 +4,7 @@
 #include <sys/select.h>
 #include <stdio.h>
 #include <time.h>
+#include <stdbool.h>
 
 #define DESIRED_WIDTH  70
 #define DESIRED_HEIGHT 25
@@ -15,78 +16,98 @@ typedef struct {
     int y;
 } pos;
 pos fruit;
+pos enemy_head;
 
 // 2D array of all spaces on the board.
 bool *spaces;
 
 // --------------------------------------------------------------------------
-// Queue stuff
+// Queue stuff (Refactored to support multiple queues for multiple snakes)
 
 // Queue implemented as a doubly linked list
-struct s_node
-{
-    pos *position; // **TODO: make this a void pointer for generality.
+typedef struct s_node {
+    pos *position; 
     struct s_node *prev;
     struct s_node *next;
-} *front=NULL, *back=NULL;
-typedef struct s_node node;
+} node;
+
+typedef struct {
+    node *front;
+    node *back;
+} queue;
+
+queue player_q = {NULL, NULL};
+queue enemy_q = {NULL, NULL};
 
 // Returns the position at the front w/o dequeing
-pos* peek( )
-{
-    return front == NULL ? NULL : front->position;
+pos* peek( queue *q ) {
+    return q->front == NULL ? NULL : q->front->position;
 }
 
-// Returns the position at the front and dequeues
-pos* dequeue( )
-{
-    node *oldfront = front;
-    front = front->next;
-    return oldfront->position;
+// Returns the position at the front and dequeues (Fixed memory leak from original)
+pos dequeue( queue *q ) {
+    pos p = {-1, -1};
+    if( q->front == NULL ) return p;
+    
+    node *oldfront = q->front;
+    q->front = q->front->next;
+    
+    if( q->front == NULL )
+        q->back = NULL;
+    else
+        q->front->prev = NULL;
+
+    p.x = oldfront->position->x;
+    p.y = oldfront->position->y;
+    
+    free( oldfront->position );
+    free( oldfront );
+    return p;
 }
 
 // Queues a position at the back
-void enqueue( pos position )
-{
-   pos *newpos   = (pos*)  malloc( sizeof( position ) ); 
-   node *newnode = (node*) malloc( sizeof( node ) );
+void enqueue( queue *q, pos position ) {
+    pos *newpos   = (pos*)  malloc( sizeof( pos ) ); 
+    node *newnode = (node*) malloc( sizeof( node ) );
 
-   newpos->x = position.x;
-   newpos->y = position.y;
-   newnode->position = newpos;
+    newpos->x = position.x;
+    newpos->y = position.y;
+    newnode->position = newpos;
+    newnode->next = NULL;
+    newnode->prev = q->back;
 
-   if( front == NULL && back == NULL )
-       front = back = newnode;
-   else
-   {
-       back->next = newnode;
-       newnode->prev = back;
-       back = newnode;
-   }
+    if( q->front == NULL && q->back == NULL ) {
+        q->front = q->back = newnode;
+    } else {
+        q->back->next = newnode;
+        q->back = newnode;
+    }
+}
+
+void free_queue( queue *q ) {
+    while( q->front ) {
+        node *n = q->front;
+        q->front = q->front->next;
+        free( n->position );
+        free( n );
+    }
 }
 // --------------------------------------------------------------------------
 // End Queue stuff
 
-// --------------------------------------------------------------------------
-// Snake stuff
-
 // Writes text to a coordinate
-void snake_write_text( int y, int x, char* str )
-{
+void snake_write_text( int y, int x, char* str ) {
     mvwaddstr( g_mainwin, y , x, str );
 }
 
 // Draws the borders
-void snake_draw_board( )
-{
+void snake_draw_board( ) {
     int i;
-    for( i=0; i<g_height; i++ )
-    {
+    for( i=0; i<g_height; i++ ) {
         snake_write_text( i, 0,         "X" );
         snake_write_text( i, g_width-1, "X" );
     }
-    for( i=1; i<g_width-1; i++ )
-    {
+    for( i=1; i<g_width-1; i++ ) {
         snake_write_text( 0, i,          "X" );
         snake_write_text( g_height-1, i, "X" );
     }
@@ -94,79 +115,137 @@ void snake_draw_board( )
 }
 
 // Resets the terminal window and clears up the mem
-void snake_game_over( )
-{
+void snake_game_over( ) {
     free( spaces );
-    while( front )
-    {
-        node *n = front;
-        front = front->next;
-        free( n );
-    }
+    free_queue( &player_q );
+    free_queue( &enemy_q );
     endwin();
     exit(0);
 }
 
 // Is the current position in bounds?
-bool snake_in_bounds( pos position )
-{
+bool snake_in_bounds( pos position ) {
     return position.y < g_height - 1 && position.y > 0 && position.x < g_width - 1 && position.x > 0;
 }
 
-// 2D matrix of possible positions implemented with a 1D array. This maps
-// the x,y coordinates to an index in the array.
-int snake_cooridinate_to_index( pos position )
-{
+// Maps the x,y coordinates to an index in the array.
+int snake_cooridinate_to_index( pos position ) {
     return g_width * position.y + position.x;
 }
 
-// Similarly this functions maps an index back to a position
-pos snake_index_to_coordinate( int index )
-{
+// Maps an index back to a position
+pos snake_index_to_coordinate( int index ) {
     int x = index % g_width;
     int y = index / g_width;
     return (pos) { x, y };
 }
 
 // Draw the fruit somewhere randomly on the board
-void snake_draw_fruit( )
-{
+void snake_draw_fruit( ) {
     attrset( COLOR_PAIR( 3 ) );
     int idx;
-    do
-    {
+    do {
         idx = rand( ) % ( g_width * g_height );
         fruit = snake_index_to_coordinate( idx );
-    }
-    while( spaces[idx] || !snake_in_bounds( fruit ) );    
+    } while( spaces[idx] || !snake_in_bounds( fruit ) );    
     snake_write_text( fruit.y, fruit.x, "F" );
 }
 
+// LEVEL 2: Moves the fruit randomly
+void snake_move_fruit() {
+    int dir = rand() % 4; // 0: up, 1: down, 2: left, 3: right
+    pos next_fruit = fruit;
+    
+    if (dir == 0) next_fruit.y--;
+    else if (dir == 1) next_fruit.y++;
+    else if (dir == 2) next_fruit.x--;
+    else if (dir == 3) next_fruit.x++;
+
+    // Only move if the spot is inside bounds and unoccupied
+    if (snake_in_bounds(next_fruit) && !spaces[snake_cooridinate_to_index(next_fruit)]) {
+        snake_write_text(fruit.y, fruit.x, " "); // Clear old fruit
+        fruit = next_fruit;
+        attrset(COLOR_PAIR(3));
+        snake_write_text(fruit.y, fruit.x, "F"); // Draw new fruit
+    }
+}
+
+// LEVEL 3: Enemy snake logic
+void snake_move_enemy() {
+    pos next_head = enemy_head;
+    
+    // AI: Move toward the fruit
+    if (fruit.x > enemy_head.x) next_head.x++;
+    else if (fruit.x < enemy_head.x) next_head.x--;
+    else if (fruit.y > enemy_head.y) next_head.y++;
+    else if (fruit.y < enemy_head.y) next_head.y--;
+
+    // If primary move is blocked, try any open adjacent spot to avoid getting stuck
+    int idx = snake_cooridinate_to_index(next_head);
+    if (!snake_in_bounds(next_head) || spaces[idx]) {
+        pos options[4] = {
+            {enemy_head.x+1, enemy_head.y}, {enemy_head.x-1, enemy_head.y},
+            {enemy_head.x, enemy_head.y+1}, {enemy_head.x, enemy_head.y-1}
+        };
+        bool found = false;
+        for(int i=0; i<4; i++) {
+            if (snake_in_bounds(options[i]) && !spaces[snake_cooridinate_to_index(options[i])]) {
+                next_head = options[i];
+                found = true;
+                break;
+            }
+        }
+        if (!found) return; // Completely blocked, skip turn
+    }
+
+    enemy_head = next_head;
+
+    // Check Loss Condition: Enemy eats the food
+    if (enemy_head.x == fruit.x && enemy_head.y == fruit.y) {
+        snake_game_over();
+    }
+    
+    idx = snake_cooridinate_to_index(enemy_head);
+    // Check Loss Condition: Enemy hits the player
+    if (spaces[idx]) {
+        snake_game_over();
+    }
+    
+    // Update enemy body
+    spaces[idx] = true;
+    enqueue(&enemy_q, enemy_head);
+    
+    // Fixed length of 3: Dequeue tail
+    pos tail = dequeue(&enemy_q);
+    spaces[snake_cooridinate_to_index(tail)] = false;
+    snake_write_text(tail.y, tail.x, " ");
+    
+    attrset(COLOR_PAIR(6)); // Draw enemy in Magenta
+    snake_write_text(enemy_head.y, enemy_head.x, "E");
+}
+
 // Handles moving the snake for each iteration
-bool snake_move_player( pos head )
-{
+bool snake_move_player( pos head ) {
     attrset( COLOR_PAIR( 1 ) ) ;
     
-    // Check if we ran into ourself
+    // Check if we ran into ourself or the enemy
     int idx = snake_cooridinate_to_index( head );
     if( spaces[idx] )
         snake_game_over( );
+        
     spaces[idx] = true; // Mark the space as occupied
-    enqueue( head );
+    enqueue( &player_q, head );
     g_score += 10;
     
     // Check if we're eating the fruit
-    if( head.x == fruit.x && head.y == fruit.y )
-    {
+    if( head.x == fruit.x && head.y == fruit.y ) {
         snake_draw_fruit( );
         g_score += 1000;
-    }
-    else
-    {
+    } else {
         // Handle the tail
-        pos *tail = dequeue( );
-        spaces[snake_cooridinate_to_index( *tail )] = false;
-        snake_write_text( tail->y, tail->x, " " );
+        pos tail = dequeue( &player_q );
+        spaces[snake_cooridinate_to_index( tail )] = false;
+        snake_write_text( tail.y, tail.x, " " );
     }
     
     // Draw the new head 
@@ -177,11 +256,10 @@ bool snake_move_player( pos head )
     sprintf( buffer, "%d", g_score );
     attrset( COLOR_PAIR( 2 ) );
     snake_write_text( g_height+1, 9, buffer );
-
+    return true;
 }
 
-int main( int argc, char *argv[] )
-{
+int main( int argc, char *argv[] ) {
     int key = KEY_RIGHT;
     if( ( g_mainwin = initscr() ) == NULL ) {
         perror( "error initialising ncurses" );
@@ -210,55 +288,56 @@ int main( int argc, char *argv[] )
     
     // Set up the 2D array of all spaces
     spaces = (bool*) malloc( sizeof( bool ) * g_height * g_width );
+    for(int i = 0; i < g_height * g_width; i++) spaces[i] = false; // Initialize to avoid garbage data
 
     snake_draw_board( );
     snake_draw_fruit( );
+    
+    // Init Player Snake
     pos head = { 5,5 };
-    enqueue( head );
+    enqueue( &player_q, head );
+    
+    // Init Enemy Snake (Level-3)
+    enemy_head = (pos){ g_width - 5, g_height - 5 };
+    for(int i=0; i<3; i++) {
+        pos body_part = {enemy_head.x - 2 + i, enemy_head.y};
+        enqueue(&enemy_q, body_part);
+        spaces[snake_cooridinate_to_index(body_part)] = true;
+        attrset(COLOR_PAIR(6));
+        snake_write_text(body_part.y, body_part.x, "E");
+    }
+    
+    int tick = 0; // Tracks game loops to control speeds
     
     // Event loop
-    while( 1 )
-    {
+    while( 1 ) {
+        tick++;
         int in = getch( );
         if( in != ERR )
             key = in;
-        switch( key )
-        {
-            case KEY_DOWN:
-            case 'j':
-            case 'J':
-            case 's':
-            case 'S':
-                head.y++;
-                break;
-            case KEY_RIGHT:
-            case 'l':
-            case 'L':
-            case 'd':
-            case 'D':
-                head.x++;
-                break;
-            case KEY_UP:
-            case 'k':
-            case 'K':
-            case 'w':
-            case 'W':
-                head.y--;
-                break;
-            case KEY_LEFT:
-            case 'h':
-            case 'H':
-            case 'a':
-            case 'A':
-                head.x--;
-                break;
-
+            
+        switch( key ) {
+            case KEY_DOWN: case 'j': case 'J': case 's': case 'S':
+                head.y++; break;
+            case KEY_RIGHT: case 'l': case 'L': case 'd': case 'D':
+                head.x++; break;
+            case KEY_UP: case 'k': case 'K': case 'w': case 'W':
+                head.y--; break;
+            case KEY_LEFT: case 'h': case 'H': case 'a': case 'A':
+                head.x--; break;
         }
+        
+        // Player moves every loop
         if( !snake_in_bounds( head ) )    
             snake_game_over( );
         else
             snake_move_player( head );
+            
+        // Level 2 & 3: Moving food and enemy (they move at half speed)
+        if (tick % 2 == 0) {
+            snake_move_fruit();
+            snake_move_enemy();
+        }
     }
     snake_game_over( );
 }
-
